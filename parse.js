@@ -384,6 +384,11 @@ function lexFence(src) {
   const info = m[2];
   if (fence[0] === '`' && info.includes('`')) return null;
   const indent = /^ */.exec(m[0])[0].length;
+  // Indent compensation: marked removes the fence line's indent
+  // from every content line for backtick fences, but for tilde
+  // fences only when the info string contains whitespace (a plain
+  // "~~~lang" fence keeps its content lines verbatim).
+  const compensate = fence[0] === '`' || /\s/.test(info);
   let len = m[0].length;
   const contentLines = [];
   let rest = src.slice(len);
@@ -397,7 +402,7 @@ function lexFence(src) {
       closed = true;
       break;
     }
-    contentLines.push(stripFenceIndent(line, indent));
+    contentLines.push(compensate ? stripFenceIndent(line, indent) : line);
     len += lineLen;
     rest = rest.slice(lineLen);
   }
@@ -1212,9 +1217,9 @@ function lexParagraph(src, lazyRel = null, inList = false, stripFirst = false) {
     if (lazyRel && lazyRel.has(lineIdx)) {
       // a lazy continuation line absorbed by a container: it can never
       // interrupt or convert the paragraph. A lazy line indented by
-      // three or more columns loses its indent; a line with at most
-      // two columns is kept verbatim.
-      lines.push(indentColumns(line, 0).cols >= 3 ? line.replace(/^[ \t]+/, '') : line);
+      // four or more columns loses its indent; a line with at most
+      // three columns is kept verbatim.
+      lines.push(indentColumns(line, 0).cols >= 4 ? line.replace(/^[ \t]+/, '') : line);
       len += ll;
       rest = rest.slice(ll);
       continue;
@@ -1331,7 +1336,7 @@ function lexBlocks(src, links, lazyAbs = null, inList = false) {
 
 const AUTOLINK_SCHEME_RE = /^<([a-zA-Z][a-zA-Z0-9+.-]{1,31}:[^<>\s]*)>/;
 const AUTOLINK_EMAIL_RE = /^<([a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)>/;
-const EXT_URL_RE = /(?:[hH][tT][tT][pP][sS]?:\/\/|www\.)(?:[^\s<(]+|\((?![^\s<()]*:\/\/)[^\s<()]*\))+/g;
+const EXT_URL_RE = /(?:[hH][tT][tT][pP][sS]?:\/\/|www\.)(?:[^\s<(]+|\([^\s<()]*\))+/g;
 const EXT_EMAIL_RE = /[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+/g;
 const EXT_SCHEME_MAIL_RE = /(mailto|xmpp):([a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+)(\/[a-zA-Z0-9._~@-]+)?/g;
 
@@ -1742,24 +1747,63 @@ const INLINE_SPECIALS = new Set(['\\', '`', '<', '[', '!', '*', '_', '~', '\n'])
 // not autolink inside link text or image alt text.
 function inlineNodes(text, links, inLink, autolink = false) {
   const found = autolink ? findExtAutolinks(text) : { ranges: [], rescued: [] };
-  const ranges = found.ranges;
+  let ranges = found.ranges;
+  let rescuedAll = found.rescued;
   // Dead zones: '_' runs inside the bracket text of a link that
   // failed because of the emphasis/code-span chunk limit stay inert
   // in the literal fallback (marked never tokenises them as
   // emphasis there). Only computed outside link text.
   const deadUnderscores = new Set();
+  // Emphasis dead regions: a link whose text holds a backtick run
+  // of length >= 2 with no equal-length partner inside the text
+  // leaves the emphasis that follows it (up to the next link)
+  // inert — marked's emphasis matching never sees those runs.
+  const deadRegions = [];
   if (!inLink) {
+    const linkSpans = [];
     for (let b = 0; b < text.length; b++) {
       const isImg = text[b] === '!' && text[b + 1] === '[';
       if (text[b] !== '[' && !isImg) continue;
       const start = isImg ? b + 1 : b;
-      if (tryLink(text, b, links)) continue;
+      const lk = tryLink(text, b, links);
+      if (lk) {
+        linkSpans.push({ start: b, end: lk.end, textSrc: lk.textSrc });
+        continue;
+      }
       const close = findClosingBracket(text, start);
       if (close === -1) continue;
       const inner = text.slice(start + 1, close);
       for (const p of findEmCodeChunks(inner)) {
         deadUnderscores.add(start + 1 + p.o.st);
         deadUnderscores.add(start + 1 + p.c.st);
+      }
+    }
+    for (let k = 0; k < linkSpans.length; k++) {
+      const ls = linkSpans[k];
+      // unmatched multi-backtick run inside the link text?
+      const runs = [];
+      const ts = ls.textSrc;
+      for (let x = 0; x < ts.length;) {
+        if (ts[x] !== '`') { x++; continue; }
+        let y = x;
+        while (y < ts.length && ts[y] === '`') y++;
+        runs.push({ st: x, len: y - x });
+        x = y;
+      }
+      const used = new Array(runs.length).fill(false);
+      let bad = false;
+      for (let a = 0; a < runs.length; a++) {
+        if (used[a]) continue;
+        let partner = -1;
+        for (let c = a + 1; c < runs.length; c++) {
+          if (!used[c] && runs[c].len === runs[a].len) { partner = c; break; }
+        }
+        if (partner >= 0) { used[a] = used[partner] = true; continue; }
+        if (runs[a].len >= 2) { bad = true; break; }
+      }
+      if (bad) {
+        const end = k + 1 < linkSpans.length ? linkSpans[k + 1].start : text.length;
+        deadRegions.push({ st: ls.start, en: end });
       }
     }
   }
@@ -1780,6 +1824,21 @@ function inlineNodes(text, links, inLink, autolink = false) {
   };
   let i = 0;
   while (i < text.length) {
+    // A token jump may have crossed the start of a precomputed
+    // autolink range (e.g. a URL inside a link destination whose
+    // match would have swallowed a following "](" junction). Marked
+    // lexes autolinks on the remaining source, so recompute the
+    // ranges for the text that is actually left.
+    if (autolink && rangeIdx < ranges.length && ranges[rangeIdx].start < i) {
+      const tail = findExtAutolinks(text.slice(i));
+      ranges = tail.ranges.map(r => ({ ...r, start: r.start + i, end: r.end + i }));
+      // rescued candidates already collected stay valid (their text
+      // nodes are already emitted; the delimiter pass confirms or
+      // ignores them by position), the tail scan adds its own
+      rescuedAll = rescuedAll.concat(
+        tail.rescued.map(r => ({ ...r, start: r.start + i, end: r.end + i })));
+      rangeIdx = 0;
+    }
     while (rangeIdx < ranges.length && ranges[rangeIdx].start < i) rangeIdx++;
     if (rangeIdx < ranges.length && ranges[rangeIdx].start === i) {
       flush();
@@ -1996,7 +2055,7 @@ function inlineNodes(text, links, inLink, autolink = false) {
     }
   }
   flush();
-  return processDelimiters(nodes, found.rescued, text);
+  return processDelimiters(nodes, rescuedAll, text, deadRegions);
 }
 
 // ------------------------------------------------------------- emphasis pass
@@ -2004,7 +2063,7 @@ function inlineNodes(text, links, inLink, autolink = false) {
 // Resolve delim nodes into em/strong/del wrappers (CommonMark's
 // delimiter-run algorithm).
 
-function processDelimiters(nodes, rescued = [], srcText = '') {
+function processDelimiters(nodes, rescued = [], srcText = '', deadRegions = []) {
   const delims = [];
   for (let k = 0; k < nodes.length; k++) {
     if (nodes[k].t === 'delim') delims.push({ node: nodes[k], idx: k });
@@ -2023,6 +2082,13 @@ function processDelimiters(nodes, rescued = [], srcText = '') {
       if ((opener.node.canClose || closer.node.canOpen) &&
           (opener.node.n + closer.node.n) % 3 === 0 &&
           !(opener.node.n % 3 === 0 && closer.node.n % 3 === 0)) {
+        oi--;
+        continue;
+      }
+      // emphasis dead region (a preceding link text held an
+      // unmatched multi-backtick run): the pair never matches
+      if (deadRegions.length && opener.node.st !== undefined &&
+          deadRegions.some(r => opener.node.st >= r.st && opener.node.st < r.en)) {
         oi--;
         continue;
       }
@@ -2047,7 +2113,7 @@ function processDelimiters(nodes, rescued = [], srcText = '') {
         pred.ch === '*' && pred.n === 0 && pred.n0 >= 2 && pred.usedL >= 2 &&
         pred.en !== undefined && closer.node.st !== undefined &&
         closer.node.st > pred.en &&
-        !/\s/.test(srcText.slice(pred.en, closer.node.st)) &&
+        !isSpace(srcText[pred.en]) &&
         /\s/.test(srcText.slice(opener.node.en - opener.node.usedR, pred.st)) &&
         // ... and the strong the previous run closed began at a
         // word boundary: "**a *b* c**d*" stays literal, but in
